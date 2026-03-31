@@ -187,7 +187,10 @@ if response.choices[0].message.tool_calls:
 python agents-yd/s01_agent_loop.py
 
 chcp 65001  --防止中文乱码
-venv\Scripts\python agents-yd\s01_agent_loop.py
+//openai 格式
+venv\Scripts\python agents-yd\s01_agent_loop_LM.py
+//anthropic 格式
+venv\Scripts\python agents-yd\s01_agent_loop_LM2.py
 ```
 
 如果看到 `s01 >>` 提示符，说明基本运行成功。

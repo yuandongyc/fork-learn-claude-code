@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Harness: the loop -- the model's first connection to the real world.
 """
-s01_agent_loop_openai.py - The Agent Loop (OpenAI Compatible)
+s01_agent_loop.py - The Agent Loop
 
 The entire secret of an AI coding agent in one pattern:
 
@@ -27,29 +27,26 @@ policy, hooks, and lifecycle controls on top.
 import os
 import subprocess
 
-from openai import OpenAI
+from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-client = OpenAI(
-    base_url=os.getenv("OPENAI_BASE_URL"),
-    api_key=os.getenv("OPENAI_API_KEY"),
-)
-MODEL = os.environ["MODEL_ID"]
+if os.getenv("LM_BASE_URL_A"):
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+
+client = Anthropic(base_url=os.getenv("LM_BASE_URL_A"))
+MODEL = os.environ["LM_MODEL_ID"]
 
 SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
 
 TOOLS = [{
-    "type": "function",
-    "function": {
-        "name": "bash",
-        "description": "Run a shell command.",
-        "parameters": {
-            "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
-        },
+    "name": "bash",
+    "description": "Run a shell command.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
     },
 }]
 
@@ -67,34 +64,32 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 
+# -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
     while True:
-        response = client.chat.completions.create(
-            model=MODEL, messages=messages,
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
-        message = response.choices[0].message
-        messages.append({"role": "assistant", "content": message.content, "tool_calls": message.tool_calls})
-
-        if not message.tool_calls:
+        # Append assistant turn
+        messages.append({"role": "assistant", "content": response.content})
+        # If the model didn't call a tool, we're done
+        if response.stop_reason != "tool_use":
             return
-
+        # Execute each tool call, collect results
         results = []
-        for tool_call in message.tool_calls:
-            if tool_call.type == "function":
-                print(f"\033[33m$ {tool_call.function.arguments}\033[0m")
-                output = run_bash(tool_call.function.arguments)
+        for block in response.content:
+            if block.type == "tool_use":
+                print(f"\033[33m$ {block.input['command']}\033[0m")
+                output = run_bash(block.input["command"])
                 print(output[:200])
-                results.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": output,
-                })
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": output})
         messages.append({"role": "user", "content": results})
 
 
 if __name__ == "__main__":
-    history = [{"role": "system", "content": SYSTEM}]
+    history = []
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
@@ -105,10 +100,8 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
-        if isinstance(response_content, str):
-            print(response_content)
-        elif isinstance(response_content, list):
+        if isinstance(response_content, list):
             for block in response_content:
-                if hasattr(block, "content"):
-                    print(block.content)
+                if hasattr(block, "text"):
+                    print(block.text)
         print()
