@@ -191,6 +191,9 @@ chcp 65001  --防止中文乱码
 venv\Scripts\python agents-yd\s01_agent_loop_LM.py
 //anthropic 格式
 venv\Scripts\python agents-yd\s01_agent_loop_LM2.py
+
+//调用 nvidia 
+venv\Scripts\python agents-yd\s01_agent_loop_NV.py
 ```
 
 如果看到 `s01 >>` 提示符，说明基本运行成功。
