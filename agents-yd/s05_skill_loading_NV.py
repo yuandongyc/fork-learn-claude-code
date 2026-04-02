@@ -1,25 +1,43 @@
 #!/usr/bin/env python3
-# Harness: tool dispatch -- expanding what the model can reach.
+# Harness: on-demand knowledge -- domain expertise, loaded when the model asks.
 """
-s02_tool_use_NV.py - Tools (OpenAI Compatible / NVIDIA NIM)
+s05_skill_loading_NV.py - Skills (OpenAI Compatible / NVIDIA NIM)
 
-The agent loop from s01 didn't change. We just added tools to the array
-and a dispatch map to route calls.
+Two-layer skill injection that avoids bloating the system prompt:
 
-    +----------+      +-------+      +------------------+
-    |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
-    |  prompt  |      |       |      | {                |
-    +----------+      +---+---+      |   bash: run_bash |
-                          ^          |   read: run_read |
-                          |          |   write: run_wr  |
-                          +----------+   edit: run_edit |
-                          tool_result| }                |
-                                     +------------------+
+    Layer 1 (cheap): skill names in system prompt (~100 tokens/skill)
+    Layer 2 (on demand): full skill body in tool_result
 
-Key insight: "The loop didn't change at all. I just added tools."
+    skills/
+      pdf/
+        SKILL.md          <-- frontmatter (name, description) + body
+      code-review/
+        SKILL.md
+
+    System prompt:
+    +--------------------------------------+
+    | You are a coding agent.              |
+    | Skills available:                    |
+    |   - pdf: Process PDF files...        |  <-- Layer 1: metadata only
+    |   - code-review: Review code...      |
+    +--------------------------------------+
+
+    When model calls load_skill("pdf"):
+    +--------------------------------------+
+    | tool_result:                         |
+    | <skill>                              |
+    |   Full PDF processing instructions   |  <-- Layer 2: full body
+    |   Step 1: ...                        |
+    |   Step 2: ...                        |
+    | </skill>                             |
+    +--------------------------------------+
+
+Key insight: "Don't put everything in the system prompt. Load on demand."
 """
 
+import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -34,8 +52,62 @@ client = OpenAI(
     api_key=os.getenv("NV_API_KEY", "not-needed"),
 )
 MODEL = os.environ["NV_MODEL_ID"]
+SKILLS_DIR = WORKDIR / "skills"
 
-SYSTEM = f"You are a coding agent on Windows at {WORKDIR}. Use Windows commands (dir, not ls). Use tools to solve tasks. Act, don't explain."
+
+class SkillLoader:
+    def __init__(self, skills_dir: Path):
+        self.skills_dir = skills_dir
+        self.skills = {}
+        self._load_all()
+
+    def _load_all(self):
+        if not self.skills_dir.exists():
+            return
+        for f in sorted(self.skills_dir.rglob("SKILL.md")):
+            text = f.read_text()
+            meta, body = self._parse_frontmatter(text)
+            name = meta.get("name", f.parent.name)
+            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
+
+    def _parse_frontmatter(self, text: str) -> tuple:
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+        meta = {}
+        for line in match.group(1).strip().splitlines():
+            if ":" in line:
+                key, val = line.split(":", 1)
+                meta[key.strip()] = val.strip()
+        return meta, match.group(2).strip()
+
+    def get_descriptions(self) -> str:
+        if not self.skills:
+            return "(no skills available)"
+        lines = []
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "No description")
+            tags = skill["meta"].get("tags", "")
+            line = f"  - {name}: {desc}"
+            if tags:
+                line += f" [{tags}]"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def get_content(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if not skill:
+            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+
+
+SKILL_LOADER = SkillLoader(SKILLS_DIR)
+
+SYSTEM = f"""You are a coding agent on Windows at {WORKDIR}. Use Windows commands (dir, not ls).
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+
+Skills available:
+{SKILL_LOADER.get_descriptions()}"""
 
 
 def safe_path(p: str) -> Path:
@@ -44,40 +116,36 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, text=True, timeout=120,
+                           encoding='utf-8', errors='ignore')
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-
 def run_read(path: str, limit: int = None) -> str:
     try:
-        text = safe_path(path).read_text()
-        lines = text.splitlines()
+        lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -96,6 +164,7 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
 TOOLS = [{
@@ -142,6 +211,17 @@ TOOLS = [{
             "required": ["path", "old_text", "new_text"],
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "load_skill",
+        "description": "Load specialized knowledge by name.",
+        "parameters": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Skill name to load"}},
+            "required": ["name"],
+        },
+    },
 }]
 
 
@@ -170,9 +250,12 @@ def agent_loop(messages: list):
         results = []
         for tool_call in message.tool_calls:
             handler = TOOL_HANDLERS.get(tool_call.function.name)
-            args = json.loads(tool_call.function.arguments)
-            output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
-            print(f"> {tool_call.function.name}: {output[:200]}")
+            try:
+                args = json.loads(tool_call.function.arguments)
+                output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tool_call.function.name}: {str(output)[:200]}")
             results.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
@@ -182,11 +265,10 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    import json
     history = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms05 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

@@ -225,3 +225,13 @@ test_providers.py
 # Internal analysis artifacts (not learning material)
 analysis/
 analysis_progress.md
+
+agents-yd/prompt-data
+agents-yd/temp-files
+test_project/
+tests/
+mcp_server/
+my_pkg/
+greet.py
+temp_summarize.py
+test.txt

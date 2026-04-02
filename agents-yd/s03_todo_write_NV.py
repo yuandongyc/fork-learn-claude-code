@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
-# Harness: tool dispatch -- expanding what the model can reach.
+# Harness: planning -- keeping the model on course without scripting the route.
 """
-s02_tool_use_NV.py - Tools (OpenAI Compatible / NVIDIA NIM)
+s03_todo_write_NV.py - TodoWrite (OpenAI Compatible / NVIDIA NIM)
 
-The agent loop from s01 didn't change. We just added tools to the array
-and a dispatch map to route calls.
+The model tracks its own progress via a TodoManager. A nag reminder
+forces it to keep updating when it forgets.
 
-    +----------+      +-------+      +------------------+
-    |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
-    |  prompt  |      |       |      | {                |
-    +----------+      +---+---+      |   bash: run_bash |
-                          ^          |   read: run_read |
-                          |          |   write: run_wr  |
-                          +----------+   edit: run_edit |
-                          tool_result| }                |
-                                     +------------------+
+    +----------+      +-------+      +---------+
+    |   User   | ---> |  LLM  | ---> | Tools   |
+    |  prompt  |      |       |      | + todo  |
+    +----------+      +---+---+      +----+----+
+                          ^               |
+                          |   tool_result |
+                          +---------------+
+                                |
+                    +-----------+-----------+
+                    | TodoManager state     |
+                    | [ ] task A            |
+                    | [>] task B <- doing   |
+                    | [x] task C            |
+                    +-----------------------+
+                                |
+                    if rounds_since_todo >= 3:
+                      inject <reminder>
 
-Key insight: "The loop didn't change at all. I just added tools."
+Key insight: "The agent can track its own progress -- and I can see it."
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -35,7 +44,49 @@ client = OpenAI(
 )
 MODEL = os.environ["NV_MODEL_ID"]
 
-SYSTEM = f"You are a coding agent on Windows at {WORKDIR}. Use Windows commands (dir, not ls). Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"""You are a coding agent on Windows at {WORKDIR}.
+Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Use Windows commands (dir, not ls). Prefer tools over prose."""
+
+
+class TodoManager:
+    def __init__(self):
+        self.items = []
+
+    def update(self, items: list) -> str:
+        if len(items) > 20:
+            raise ValueError("Max 20 todos allowed")
+        validated = []
+        in_progress_count = 0
+        for i, item in enumerate(items):
+            text = str(item.get("text", "")).strip()
+            status = str(item.get("status", "pending")).lower()
+            item_id = str(item.get("id", str(i + 1)))
+            if not text:
+                raise ValueError(f"Item {item_id}: text required")
+            if status not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"Item {item_id}: invalid status '{status}'")
+            if status == "in_progress":
+                in_progress_count += 1
+            validated.append({"id": item_id, "text": text, "status": status})
+        if in_progress_count > 1:
+            raise ValueError("Only one task can be in_progress at a time")
+        self.items = validated
+        return self.render()
+
+    def render(self) -> str:
+        if not self.items:
+            return "No todos."
+        lines = []
+        for item in self.items:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
+            lines.append(f"{marker} #{item['id']}: {item['text']}")
+        done = sum(1 for t in self.items if t["status"] == "completed")
+        lines.append(f"\n({done}/{len(self.items)} completed)")
+        return "\n".join(lines)
+
+
+TODO = TodoManager()
 
 
 def safe_path(p: str) -> Path:
@@ -44,40 +95,36 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, text=True, timeout=120,
+                           encoding='utf-8', errors='ignore')
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-
 def run_read(path: str, limit: int = None) -> str:
     try:
-        text = safe_path(path).read_text()
-        lines = text.splitlines()
+        lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -96,6 +143,7 @@ TOOL_HANDLERS = {
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "todo":       lambda **kw: TODO.update(kw["items"]),
 }
 
 TOOLS = [{
@@ -142,10 +190,22 @@ TOOLS = [{
             "required": ["path", "old_text", "new_text"],
         },
     },
+}, {
+    "type": "function",
+    "function": {
+        "name": "todo",
+        "description": "Update task list. Track progress on multi-step tasks.",
+        "parameters": {
+            "type": "object",
+            "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}},
+            "required": ["items"],
+        },
+    },
 }]
 
 
 def agent_loop(messages: list):
+    rounds_since_todo = 0
     while True:
         response = client.chat.completions.create(
             model=MODEL,
@@ -168,25 +228,35 @@ def agent_loop(messages: list):
             return
 
         results = []
+        used_todo = False
         for tool_call in message.tool_calls:
             handler = TOOL_HANDLERS.get(tool_call.function.name)
-            args = json.loads(tool_call.function.arguments)
-            output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
-            print(f"> {tool_call.function.name}: {output[:200]}")
+            try:
+                args = json.loads(tool_call.function.arguments)
+                output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
+            except Exception as e:
+                output = f"Error: {e}"
+            print(f"> {tool_call.function.name}: {str(output)[:200]}")
             results.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
                 "content": str(output),
             })
-        messages.extend(results)
+            if tool_call.function.name == "todo":
+                used_todo = True
+
+        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+        if rounds_since_todo >= 3:
+            messages.append({"role": "user", "content": "<reminder>Update your todos.</reminder>"})
+        else:
+            messages.extend(results)
 
 
 if __name__ == "__main__":
-    import json
     history = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms03 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

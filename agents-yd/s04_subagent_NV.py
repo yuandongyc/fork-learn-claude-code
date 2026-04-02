@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
-# Harness: tool dispatch -- expanding what the model can reach.
+# Harness: context isolation -- protecting the model's clarity of thought.
 """
-s02_tool_use_NV.py - Tools (OpenAI Compatible / NVIDIA NIM)
+s04_subagent_NV.py - Subagents (OpenAI Compatible / NVIDIA NIM)
 
-The agent loop from s01 didn't change. We just added tools to the array
-and a dispatch map to route calls.
+Spawn a child agent with fresh messages=[]. The child works in its own
+context, sharing the filesystem, then returns only a summary to the parent.
 
-    +----------+      +-------+      +------------------+
-    |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
-    |  prompt  |      |       |      | {                |
-    +----------+      +---+---+      |   bash: run_bash |
-                          ^          |   read: run_read |
-                          |          |   write: run_wr  |
-                          +----------+   edit: run_edit |
-                          tool_result| }                |
-                                     +------------------+
+    Parent agent                     Subagent
+    +------------------+             +------------------+
+    | messages=[...]   |             | messages=[]      |  <-- fresh
+    |                  |  dispatch   |                  |
+    | tool: task       | ---------->| while tool_use:  |
+    |   prompt="..."   |            |   call tools     |
+    |   description="" |            |   append results |
+    |                  |  summary   |                  |
+    |   result = "..." | <--------- | return last text |
+    +------------------+             +------------------+
+              |
+    Parent context stays clean.
+    Subagent context is discarded.
 
-Key insight: "The loop didn't change at all. I just added tools."
+Key insight: "Process isolation gives context isolation for free."
 """
 
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -35,7 +40,8 @@ client = OpenAI(
 )
 MODEL = os.environ["NV_MODEL_ID"]
 
-SYSTEM = f"You are a coding agent on Windows at {WORKDIR}. Use Windows commands (dir, not ls). Use tools to solve tasks. Act, don't explain."
+SYSTEM = f"You are a coding agent on Windows at {WORKDIR}. Use the task tool to delegate exploration or subtasks. Use Windows commands (dir, not ls)."
+SUBAGENT_SYSTEM = f"You are a coding subagent on Windows at {WORKDIR}. Complete the given task, then summarize your findings. Use Windows commands (dir, not ls)."
 
 
 def safe_path(p: str) -> Path:
@@ -44,40 +50,36 @@ def safe_path(p: str) -> Path:
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
-
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+                           capture_output=True, text=True, timeout=120,
+                           encoding='utf-8', errors='ignore')
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-
 def run_read(path: str, limit: int = None) -> str:
     try:
-        text = safe_path(path).read_text()
-        lines = text.splitlines()
+        lines = safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_write(path: str, content: str) -> str:
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -98,7 +100,7 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-TOOLS = [{
+CHILD_TOOLS = [{
     "type": "function",
     "function": {
         "name": "bash",
@@ -145,12 +147,66 @@ TOOLS = [{
 }]
 
 
+def run_subagent(prompt: str) -> str:
+    sub_messages = [{"role": "user", "content": prompt}]
+    for _ in range(30):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=sub_messages,
+            tools=CHILD_TOOLS,
+            max_tokens=8000,
+        )
+        message = response.choices[0].message
+
+        if message.tool_calls:
+            sub_messages.append({
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in message.tool_calls
+                ]
+            })
+            results = []
+            for tool_call in message.tool_calls:
+                handler = TOOL_HANDLERS.get(tool_call.function.name)
+                args = json.loads(tool_call.function.arguments)
+                output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
+                results.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": str(output)[:50000],
+                })
+            sub_messages.extend(results)
+        else:
+            sub_messages.append({"role": "assistant", "content": message.content})
+            break
+
+    for msg in reversed(sub_messages):
+        if msg.get("role") == "assistant" and msg.get("content"):
+            return msg["content"]
+    return "(no summary)"
+
+
+PARENT_TOOLS = CHILD_TOOLS + [{
+    "type": "function",
+    "function": {
+        "name": "task",
+        "description": "Spawn a subagent with fresh context. It shares the filesystem but not conversation history.",
+        "parameters": {
+            "type": "object",
+            "properties": {"prompt": {"type": "string"}, "description": {"type": "string"}},
+            "required": ["prompt"],
+        },
+    },
+}]
+
+
 def agent_loop(messages: list):
     while True:
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             max_tokens=8000,
         )
         message = response.choices[0].message
@@ -169,10 +225,16 @@ def agent_loop(messages: list):
 
         results = []
         for tool_call in message.tool_calls:
-            handler = TOOL_HANDLERS.get(tool_call.function.name)
-            args = json.loads(tool_call.function.arguments)
-            output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
-            print(f"> {tool_call.function.name}: {output[:200]}")
+            if tool_call.function.name == "task":
+                args = json.loads(tool_call.function.arguments)
+                desc = args.get("description", "subtask")
+                print(f"> task ({desc}): {args['prompt'][:80]}")
+                output = run_subagent(args["prompt"])
+            else:
+                handler = TOOL_HANDLERS.get(tool_call.function.name)
+                args = json.loads(tool_call.function.arguments)
+                output = handler(**args) if handler else f"Unknown tool: {tool_call.function.name}"
+            print(f"  {str(output)[:200]}")
             results.append({
                 "role": "tool",
                 "tool_call_id": tool_call.id,
@@ -182,11 +244,10 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    import json
     history = [{"role": "system", "content": SYSTEM}]
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms04 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
