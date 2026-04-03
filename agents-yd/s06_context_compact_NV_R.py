@@ -233,10 +233,16 @@ TOOLS = [
 
 def agent_loop(messages: list):
     while True:
-        micro_compact(messages)
+        # ===== 修复后的顺序 =====
+        # 1. 先判断 token 是否超过阈值
         if estimate_tokens(messages) > THRESHOLD:
+            # 2. 如果超过阈值，先用原始内容做摘要
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
+        else:
+            # 3. 如果不超限，再做 micro_compact 替换占位符
+            micro_compact(messages)
+        # =============================
 
         system_msg = {"role": "system", "content": SYSTEM}
         response = client.chat.completions.create(

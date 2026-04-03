@@ -62,7 +62,7 @@ function NodeShape({ node }: { node: FlowNode }) {
             y={node.y + (i - (lines.length - 1) / 2) * 12}
             textAnchor="middle"
             dominantBaseline="central"
-            fontSize={10}
+            fontSize={16}
             fontFamily="monospace"
             fill="currentColor"
           >
@@ -91,7 +91,7 @@ function NodeShape({ node }: { node: FlowNode }) {
           y={node.y}
           textAnchor="middle"
           dominantBaseline="central"
-          fontSize={12}
+          fontSize={16}
           fontWeight={600}
           fontFamily="monospace"
           fill="currentColor"
@@ -123,7 +123,7 @@ function NodeShape({ node }: { node: FlowNode }) {
           y={node.y + (i - (lines.length - 1) / 2) * 13}
           textAnchor="middle"
           dominantBaseline="central"
-          fontSize={11}
+          fontSize={16}
           fontFamily="monospace"
           fill="currentColor"
         >
@@ -167,7 +167,7 @@ function EdgePath({
         <motion.text
           x={midX + 8}
           y={midY - 4}
-          fontSize={10}
+          fontSize={16}
           fill="var(--color-text-secondary)"
           fontFamily="monospace"
           initial={{ opacity: 0 }}
