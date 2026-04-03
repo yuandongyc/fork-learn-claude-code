@@ -36,6 +36,7 @@ Key insight: "The agent can forget strategically and keep working forever."
 
 import json
 import os
+import platform
 import subprocess
 import time
 from pathlib import Path
@@ -52,7 +53,25 @@ client = OpenAI(
 MODEL = os.environ["NV_MODEL_ID"]
 
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
+IS_WINDOWS = platform.system() == "Windows"
+
+ENV_HINT = "Windows environment: prefer read_file/glob over bash commands." if IS_WINDOWS else ""
+TASK_PATTERN = (
+    "CRITICAL RULE: After calling glob ONE time, you MUST NOT call glob again in the same conversation turn.\n"
+    "Task 'Read all files': 1) glob once, 2) read all files from that list sequentially, 3) STOP.\n"
+    "Task 'Search code': 1) grep once, 2) read files, 3) STOP."
+)
+SYSTEM = (
+    f"You are a coding agent at {WORKDIR}.\n"
+    "Tool usage priority:\n"
+    "1. read_file/glob - file reading & discovery (recommended)\n"
+    "2. grep - content search in large codebases\n"
+    "3. edit_file - text replacement\n"
+    "4. bash - only when necessary\n"
+    f"{ENV_HINT}\n"
+    f"{TASK_PATTERN}\n"
+    "Use tools to solve tasks."
+)
 
 THRESHOLD = 50000
 TRANSCRIPT_DIR = WORKDIR / ".transcripts"
@@ -96,7 +115,7 @@ def micro_compact(messages: list) -> list:
 
 
 # -- Layer 2: auto_compact - save transcript, summarize, replace messages --
-def auto_compact(messages: list) -> list:
+def auto_compact(messages: list) -> tuple[list, str]:
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
     transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(transcript_path, "w") as f:
@@ -113,11 +132,12 @@ def auto_compact(messages: list) -> list:
         max_tokens=2000,
     )
     summary = response.choices[0].message.content
-    if not summary:
+    if summary is None or summary == "":
         summary = "No summary generated."
-    return [
+    compressed_messages = [
         {"role": "user", "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}"},
     ]
+    return compressed_messages, summary
 
 
 # -- Tool implementations --
@@ -170,9 +190,39 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Error: {e}"
 
 
+def run_glob(pattern: str) -> str:
+    try:
+        matches = list(WORKDIR.rglob(pattern))
+        if not matches:
+            return "(no matches)"
+        return "\n".join(str(p.relative_to(WORKDIR)) for p in matches[:100])
+    except Exception as e:
+        return f"Error: {e}"
+
+def run_grep(pattern: str, include: str = None) -> str:
+    try:
+        import fnmatch
+        matches = []
+        for p in WORKDIR.rglob(include or "*.py"):
+            if p.is_file():
+                try:
+                    content = p.read_text(encoding='utf-8', errors='ignore')
+                    if pattern in content:
+                        matches.append(str(p.relative_to(WORKDIR)))
+                except:
+                    pass
+        if not matches:
+            return "(no matches)"
+        return "\n".join(matches[:50])
+    except Exception as e:
+        return f"Error: {e}"
+
+
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
     "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "glob":       lambda **kw: run_glob(kw["pattern"]),
+    "grep":       lambda **kw: run_grep(kw["pattern"], kw.get("include")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "compact":    lambda **kw: "Manual compression requested.",
@@ -180,21 +230,40 @@ TOOL_HANDLERS = {
 
 TOOLS = [
     {"type": "function", "function": {
-        "name": "bash",
-        "description": "Run a shell command.",
+        "name": "glob",
+        "description": "ONE-TIME file discovery. After this, use read_file for each file. NEVER call glob again.",
         "parameters": {
             "type": "object",
-            "properties": {"command": {"type": "string"}},
-            "required": ["command"],
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
         },
     }},
     {"type": "function", "function": {
         "name": "read_file",
-        "description": "Read file contents.",
+        "description": "Read file contents. Recommended for file reading.",
         "parameters": {
             "type": "object",
             "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
             "required": ["path"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "glob",
+        "description": "Find files by name patterns. Recommended for file discovery.",
+        "parameters": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}},
+            "required": ["pattern"],
+        },
+    }},
+    {"type": "function", "function": {
+        "name": "grep",
+        "description": "Fast content search. Use for finding patterns in codebases. "
+                       "Windows: works in git bash / WSL.",
+        "parameters": {
+            "type": "object",
+            "properties": {"pattern": {"type": "string"}, "include": {"type": "string"}},
+            "required": ["pattern"],
         },
     }},
     {"type": "function", "function": {
@@ -228,12 +297,11 @@ TOOLS = [
 
 def agent_loop(messages: list):
     while True:
-        # Layer 1: micro_compact before each LLM call
         micro_compact(messages)
-        # Layer 2: auto_compact if token estimate exceeds threshold
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
-            messages[:] = auto_compact(messages)
+            messages[:], summary = auto_compact(messages)
+            return summary
         
         system_msg = {"role": "system", "content": SYSTEM}
         response = client.chat.completions.create(
@@ -244,7 +312,7 @@ def agent_loop(messages: list):
         messages.append({"role": "assistant", "content": message.content or "", "tool_calls": message.tool_calls})
         
         if not message.tool_calls:
-            return
+            return message.content or ""
         
         results = []
         manual_compact = False
@@ -269,10 +337,10 @@ def agent_loop(messages: list):
         
         messages.extend(results)
         
-        # Layer 3: manual compact triggered by the compact tool
         if manual_compact:
             print("[manual compact]")
-            messages[:] = auto_compact(messages)
+            messages[:], summary = auto_compact(messages)
+            return summary
 
 
 if __name__ == "__main__":
@@ -285,8 +353,7 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
-        agent_loop(history)
-        response_content = history[-1]["content"]
-        if isinstance(response_content, str):
+        response_content = agent_loop(history)
+        if response_content:
             print(response_content)
         print()
