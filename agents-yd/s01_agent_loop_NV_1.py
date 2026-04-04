@@ -40,8 +40,9 @@ def get_log_file():
     return os.path.join(LOG_DIR, f"s01_{timestamp}.log")
 
 def log_write(log_file, step: str, content: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(log_file, "a", encoding="utf-8") as f:
-        f.write(f"\n=== {step} ===\n")
+        f.write(f"\n=== [{timestamp}] {step} ===\n")
         f.write(content)
         f.write("\n")
 
@@ -49,6 +50,8 @@ def serialize_message(msg: dict) -> dict:
     result = {"role": msg["role"]}
     if "content" in msg and msg["content"]:
         result["content"] = msg["content"]
+    if "tool_call_id" in msg and msg["tool_call_id"]:
+        result["tool_call_id"] = msg["tool_call_id"]
     if "tool_calls" in msg and msg["tool_calls"]:
         tc_list = []
         for tc in msg["tool_calls"]:
