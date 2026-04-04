@@ -45,6 +45,24 @@ def log_write(log_file, step: str, content: str):
         f.write(content)
         f.write("\n")
 
+def serialize_message(msg: dict) -> dict:
+    result = {"role": msg["role"]}
+    if "content" in msg and msg["content"]:
+        result["content"] = msg["content"]
+    if "tool_calls" in msg and msg["tool_calls"]:
+        tc_list = []
+        for tc in msg["tool_calls"]:
+            tc_list.append({
+                "id": tc.id,
+                "type": tc.type,
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                }
+            })
+        result["tool_calls"] = tc_list
+    return result
+
 load_dotenv(override=True)
 
 client = OpenAI(
@@ -69,7 +87,7 @@ TOOLS = [{
 }]
 
 
-def run_bash(command: str, log_file: str) -> str:
+def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
@@ -78,36 +96,50 @@ def run_bash(command: str, log_file: str) -> str:
                            capture_output=True, text=True, timeout=120,
                            encoding='utf-8', errors='ignore')
         out = ((r.stdout or "") + (r.stderr or "")).strip()
-        log_write(log_file, f"BASH_CMD: {command}", out[:50000] if out else "(no output)")
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
-        log_write(log_file, f"TIMEOUT: {command}", "Error: Timeout (120s)")
         return "Error: Timeout (120s)"
 
 
 def agent_loop(messages: list, log_file: str):
     while True:
+        serialized_msgs = [serialize_message(m) for m in messages]
+        log_write(log_file, "SEND_TO_LLM", json.dumps(serialized_msgs, ensure_ascii=False, indent=2))
+        
         response = client.chat.completions.create(
             model=MODEL, messages=messages,
             tools=TOOLS, max_tokens=8000,
         )
         message = response.choices[0].message
-        messages.append({"role": "assistant", "content": message.content or "", "tool_calls": message.tool_calls})
-
-        # 记录 LLM 响应
-        resp_str = str(message.content) + (str(message.tool_calls) if message.tool_calls else "")
-        log_write(log_file, "LLM_RESPONSE", resp_str)
+        
+        resp_data = {"content": message.content}
+        if message.tool_calls:
+            tc_list = []
+            for tc in message.tool_calls:
+                tc_list.append({
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                })
+            resp_data["tool_calls"] = tc_list
+        log_write(log_file, "LLM_RESPONSE", json.dumps(resp_data, ensure_ascii=False, indent=2))
 
         if not message.tool_calls:
+            messages.append({"role": "assistant", "content": message.content})
             return
 
+        messages.append({"role": "assistant", "tool_calls": message.tool_calls})
+        
         results = []
         for tool_call in message.tool_calls:
             if tool_call.type == "function":
                 args = json.loads(tool_call.function.arguments)
                 cmd = args.get("command", "")
                 print(f"\033[33m$ {cmd}\033[0m")
-                output = run_bash(cmd, log_file)
+                output = run_bash(cmd)
                 print(output[:200])
                 results.append({
                     "role": "tool",
