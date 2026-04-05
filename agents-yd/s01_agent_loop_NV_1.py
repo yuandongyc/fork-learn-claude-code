@@ -128,6 +128,12 @@ def agent_loop(messages: list, log_file: str):
                     }
                 })
             resp_data["tool_calls"] = tc_list
+        if response.usage:
+            resp_data["usage"] = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens
+            }
         log_write(log_file, "LLM_RESPONSE", json.dumps(resp_data, ensure_ascii=False, indent=2))
 
         if not message.tool_calls:
@@ -156,6 +162,7 @@ if __name__ == "__main__":
     log_file = get_log_file()
     history = [{"role": "system", "content": SYSTEM}]
     log_write(log_file, "SYSTEM_PROMPT", SYSTEM)
+    log_write(log_file, "TOOLS", json.dumps(TOOLS, ensure_ascii=False, indent=2))
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
